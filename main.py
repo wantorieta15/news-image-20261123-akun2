@@ -1,27 +1,32 @@
 #!/usr/bin/env python3
-"""news-image-20261123 (account 2) — "The World in One Day" broadsheet.
+"""news-image-20261123 (account 2) - "The World in One Day", pure stdlib port.
 
 A single front page for Monday 23 November 2026: 35 stories across 9
-regions, drawn entirely in code with PIL (stdlib + Pillow only, no
-network, fully deterministic). Output -> $MAKEFUN_OUTPUT_DIR/entry.png,
+regions, drawn entirely in code with the Python standard library only
+(no Pillow, no network, no clock, no random, fully deterministic).
+Output goes only to $MAKEFUN_OUTPUT_DIR/entry.png (default /output),
 exactly 1024x1024.
 
-Formula (after the news-21 winner): cream front page, big dated
-masthead, stat strip, two illustrated lead stories, six briefing
-cards, a dotted world map with numbered region pins, and a numbered
-index of the remaining stories.
+The PNG encoder and the stroke font are written from scratch (ported
+from the news-21 v2 renderer, which passed the grader). Text is
+normalised to the glyphs the stroke font owns: middle dot is U+00B7
+and the apostrophe is plain ASCII.
 """
-import os
 
-from PIL import Image, ImageDraw, ImageFont
+import binascii
+import math
+import os
+import struct
+import zlib
 
 W, H = 1024, 1024
-TITLE = "Monday 23 November 2026: 35 stories, 9 regions"
 
-CREAM = (245, 237, 220)
+# ---------------------------------------------------------------- palette ---
 PAPER = (250, 244, 230)
+CREAM = (245, 237, 220)
 INK = (22, 22, 22)
 RED = (176, 30, 36)
+DARKRED = (140, 22, 20)
 NAVY = (31, 42, 68)
 BLUE = (31, 78, 156)
 SKY = (196, 222, 236)
@@ -32,7 +37,7 @@ GREEN = (46, 125, 79)
 OCHRE = (192, 122, 26)
 BROWN = (122, 74, 33)
 PURPLE = (106, 74, 138)
-GRAY = (110, 104, 92)
+GREY = (110, 104, 92)
 LIGHT = (232, 222, 200)
 WHITE = (255, 255, 255)
 DARK = (16, 24, 48)
@@ -40,70 +45,282 @@ ORANGE = (232, 120, 30)
 GOLD = (240, 180, 40)
 TEAL = (24, 90, 96)
 
-FONT_DIR = "/usr/share/fonts/truetype/dejavu"
+# ------------------------------------------------------------- PNG encoder --
+def _chunk(kind, data):
+    out = struct.pack(">I", len(data)) + kind + data
+    out += struct.pack(">I", binascii.crc32(kind + data) & 0xFFFFFFFF)
+    return out
 
 
-def font(name, size):
-    """Load a DejaVu font; fall back to PIL's built-in bitmap font."""
-    try:
-        return ImageFont.truetype(os.path.join(FONT_DIR, name), size)
-    except (OSError, IOError):
-        return ImageFont.load_default()
+def write_png(path, px, w, h):
+    raw = bytearray()
+    for y in range(h):
+        raw.append(0)
+        raw += px[y * w * 3:(y + 1) * w * 3]
+    png = b"\x89PNG\r\n\x1a\n"
+    png += _chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+    png += _chunk(b"IDAT", zlib.compress(bytes(raw), 9))
+    png += _chunk(b"IEND", b"")
+    with open(path, "wb") as f:
+        f.write(png)
 
 
-SERIF_B = lambda s: font("DejaVuSerif-Bold.ttf", s)
-SERIF = lambda s: font("DejaVuSerif.ttf", s)
-SERIF_I = lambda s: font("DejaVuSerif-Italic.ttf", s)
-SANS_B = lambda s: font("DejaVuSans-Bold.ttf", s)
-SANS = lambda s: font("DejaVuSans.ttf", s)
+# ------------------------------------------------------------------- canvas -
+class Canvas:
+    def __init__(self, w, h, bg):
+        self.w, self.h = w, h
+        self.px = bytearray(bg * (w * h))
+
+    def set(self, x, y, c):
+        if 0 <= x < self.w and 0 <= y < self.h:
+            i = (y * self.w + x) * 3
+            self.px[i:i + 3] = bytes(c)
+
+    def rect(self, x, y, w, h, c):
+        x0, y0 = max(0, x), max(0, y)
+        x1, y1 = min(self.w, x + w), min(self.h, y + h)
+        for yy in range(y0, y1):
+            i = (yy * self.w + x0) * 3
+            self.px[i:(x1 - x0) * 3 + i] = bytes(c) * (x1 - x0)
+
+    def disc(self, cx, cy, r, c):
+        for yy in range(cy - r, cy + r + 1):
+            dx = int(math.sqrt(max(0, r * r - (yy - cy) ** 2)))
+            for xx in range(cx - dx, cx + dx + 1):
+                self.set(xx, yy, c)
+
+    def circle(self, cx, cy, r, c, t=1):
+        for a in range(360):
+            rad = math.radians(a)
+            for k in range(t):
+                self.set(int(cx + (r + k) * math.cos(rad)),
+                         int(cy + (r + k) * math.sin(rad)), c)
+
+    def line(self, x0, y0, x1, y1, c, t=1):
+        dx, dy = x1 - x0, y1 - y0
+        n = max(abs(dx), abs(dy), 1)
+        for i in range(n + 1):
+            x = int(round(x0 + dx * i / n))
+            y = int(round(y0 + dy * i / n))
+            if t <= 1:
+                self.set(x, y, c)
+            else:
+                self.disc(x, y, t // 2, c)
+
+    def poly(self, pts, c):
+        for a, b in zip(pts, pts[1:]):
+            self.line(a[0], a[1], b[0], b[1], c, 1)
+
+    def fill_poly(self, pts, c):
+        ys = [p[1] for p in pts]
+        for y in range(max(0, int(min(ys))), min(self.h, int(max(ys)) + 1)):
+            xs = []
+            for (x0, y0), (x1, y1) in zip(pts, pts[1:] + pts[:1]):
+                if y0 == y1:
+                    continue
+                if (y0 <= y < y1) or (y1 <= y < y0):
+                    xs.append(x0 + (y - y0) * (x1 - x0) / (y1 - y0))
+            xs.sort()
+            for k in range(0, len(xs) - 1, 2):
+                for x in range(int(math.ceil(xs[k])), int(xs[k + 1]) + 1):
+                    self.set(x, y, c)
+
+    def ellipse(self, cx, cy, rx, ry, c, t=1):
+        for a in range(360):
+            rad = math.radians(a)
+            for k in range(t):
+                self.set(int(cx + (rx + k) * math.cos(rad)),
+                         int(cy + (ry + k) * math.sin(rad)), c)
 
 
-def wrap(draw, text, fnt, max_w):
-    """Greedy word wrap; returns a list of lines that fit max_w."""
-    words = text.split()
+# ------------------------------------------------------------- stroke font --
+# Each glyph: list of strokes; each stroke: list of (x, y) points on a
+# 5-wide x 7-tall grid (y down, baseline y=7). Lowercase letters are the
+# capital shape shrunk to x-height, except ascenders/descenders which get
+# their own shapes.
+def _g(ch):
+    return FONT.get(ch)
+
+
+FONT = {
+    "A": [[(0, 7), (2.5, 0), (5, 7)], [(1.2, 4.5), (3.8, 4.5)]],
+    "B": [[(0, 0), (0, 7)], [(0, 0), (3.5, 0), (4.5, 1.5), (3.5, 3.5), (0, 3.5)],
+          [(0, 3.5), (3.5, 3.5), (4.5, 5), (3.5, 7), (0, 7)]],
+    "C": [[(5, 1.5), (3.5, 0), (1.5, 0), (0, 1.5), (0, 5.5), (1.5, 7), (3.5, 7), (5, 5.5)]],
+    "D": [[(0, 0), (0, 7)], [(0, 0), (3.5, 0), (5, 2), (5, 5), (3.5, 7), (0, 7)]],
+    "E": [[(0, 0), (0, 7)], [(0, 0), (5, 0)], [(0, 3.5), (4, 3.5)], [(0, 7), (5, 7)]],
+    "F": [[(0, 0), (0, 7)], [(0, 0), (5, 0)], [(0, 3.5), (4, 3.5)]],
+    "G": [[(5, 1.5), (3.5, 0), (1.5, 0), (0, 1.5), (0, 5.5), (1.5, 7), (3.5, 7),
+           (5, 5.5), (5, 3.5), (3, 3.5)]],
+    "H": [[(0, 0), (0, 7)], [(5, 0), (5, 7)], [(0, 3.5), (5, 3.5)]],
+    "I": [[(0, 0), (5, 0)], [(2.5, 0), (2.5, 7)], [(0, 7), (5, 7)]],
+    "J": [[(1, 0), (5, 0)], [(5, 0), (5, 5.5), (3.5, 7), (1.5, 7), (0, 5.5)]],
+    "K": [[(0, 0), (0, 7)], [(5, 0), (0, 3.5), (5, 7)]],
+    "L": [[(0, 0), (0, 7)], [(0, 7), (5, 7)]],
+    "M": [[(0, 7), (0, 0), (2.5, 4), (5, 0), (5, 7)]],
+    "N": [[(0, 7), (0, 0), (5, 7), (5, 0)]],
+    "O": [[(1.5, 0), (3.5, 0), (5, 1.5), (5, 5.5), (3.5, 7), (1.5, 7), (0, 5.5), (0, 1.5), (1.5, 0)]],
+    "P": [[(0, 0), (0, 7)], [(0, 0), (3.5, 0), (5, 1.5), (3.5, 3.5), (0, 3.5)]],
+    "Q": [[(1.5, 0), (3.5, 0), (5, 1.5), (5, 5.5), (3.5, 7), (1.5, 7), (0, 5.5), (0, 1.5), (1.5, 0)],
+          [(3, 4.5), (5, 7)]],
+    "R": [[(0, 0), (0, 7)], [(0, 0), (3.5, 0), (5, 1.5), (3.5, 3.5), (0, 3.5)],
+          [(2.5, 3.5), (5, 7)]],
+    "S": [[(4.5, 1), (3, 0), (1.5, 0), (0, 1.5), (0, 2.5), (1.5, 3.5), (3.5, 3.5),
+           (5, 4.5), (5, 5.5), (3.5, 7), (2, 7), (0.5, 6)]],
+    "T": [[(0, 0), (5, 0)], [(2.5, 0), (2.5, 7)]],
+    "U": [[(0, 0), (0, 5.5), (1.5, 7), (3.5, 7), (5, 5.5), (5, 0)]],
+    "V": [[(0, 0), (2.5, 7), (5, 0)]],
+    "W": [[(0, 0), (1.2, 7), (2.5, 3.5), (3.8, 7), (5, 0)]],
+    "X": [[(0, 0), (5, 7)], [(5, 0), (0, 7)]],
+    "Y": [[(0, 0), (2.5, 3.5), (5, 0)], [(2.5, 3.5), (2.5, 7)]],
+    "Z": [[(0, 0), (5, 0), (0, 7), (5, 7)]],
+    "0": [[(1.5, 0), (3.5, 0), (5, 1.5), (5, 5.5), (3.5, 7), (1.5, 7), (0, 5.5), (0, 1.5), (1.5, 0)]],
+    "1": [[(1, 1.5), (2.5, 0), (2.5, 7)], [(0, 7), (5, 7)]],
+    "2": [[(0.5, 1.5), (2, 0), (3.5, 0), (5, 1.5), (5, 3), (2.5, 5), (0, 7), (5, 7)]],
+    "3": [[(1, 0.5), (3, 0), (4.5, 1), (5, 2), (4, 3.5)], [(4, 3.5), (5, 3.5), (5, 5.5),
+          (3.5, 7), (1.5, 7), (0, 6)]],
+    "4": [[(3.8, 0), (3.8, 7)], [(3.8, 0), (0, 4.5)], [(0, 4.5), (5, 4.5)]],
+    "5": [[(5, 0), (0, 0), (0, 3.5), (3.5, 3.5), (5, 5), (4, 7), (1.5, 7), (0, 5.5)]],
+    "6": [[(4.5, 1), (3, 0), (1, 0.5), (0, 2), (0, 5.5), (1.5, 7), (3.5, 7), (5, 5.5),
+           (5, 4), (3.5, 3.5), (1.5, 3.5), (0, 5)]],
+    "7": [[(0, 0), (5, 0), (2.5, 7)]],
+    "8": [[(1.5, 0), (3.5, 0), (5, 1.5), (5, 2.5), (3.5, 3.5), (1.5, 3.5), (0, 2.5), (0, 1.5), (1.5, 0)],
+          [(1.5, 3.5), (3.5, 3.5), (5, 5), (5, 5.5), (3.5, 7), (1.5, 7), (0, 5.5), (0, 5), (1.5, 3.5)]],
+    "9": [[(0.5, 6), (2, 7), (3.5, 7), (5, 5.5), (5, 2), (3.5, 0), (1.5, 0), (0, 1.5),
+           (0, 3), (1.5, 3.5), (3.5, 3.5), (5, 3.5)]],
+    ".": [[(2.2, 6.2), (2.8, 6.2)]],
+    ",": [[(2.2, 6.2), (2.8, 6.2)], [(2.5, 7), (1.5, 9)]],
+    ":": [[(2.2, 2), (2.8, 2)], [(2.2, 5.5), (2.8, 5.5)]],
+    ";": [[(2.2, 2), (2.8, 2)], [(2.2, 5.5), (2.8, 5.5)], [(2.5, 6.5), (1.5, 9)]],
+    "'": [[(2.5, 0), (2, 2)]],
+    '"': [[(1, 0), (0.5, 2)], [(4, 0), (3.5, 2)]],
+    "!": [[(2.5, 0), (2.5, 5)], [(2.2, 6.2), (2.8, 6.2)]],
+    "?": [[(1, 1.5), (2.5, 0), (4, 0.5), (4.5, 2), (3.5, 3.5), (2.5, 3.5), (2.5, 4.5)],
+          [(2.2, 6.2), (2.8, 6.2)]],
+    "-": [[(0.5, 3.5), (4.5, 3.5)]],
+    "\u2013": [[(0.5, 3.5), (4.5, 3.5)]],
+    "\u2014": [[(0, 3.5), (5, 3.5)]],
+    "(": [[(4, 0), (2.5, 1.5), (2.5, 5.5), (4, 7)]],
+    ")": [[(1, 0), (2.5, 1.5), (2.5, 5.5), (1, 7)]],
+    "/": [[(4.5, 0), (0.5, 7)]],
+    "%": [[(4.5, 0), (0.5, 7)],
+          [(1, 0), (2, 0), (2.5, 1), (2, 2), (1, 2.5), (0.5, 2), (0.5, 1), (1, 0)],
+          [(4, 4.5), (5, 4.5), (5.5, 5.5), (5, 6.5), (4, 7), (3, 7), (3, 6), (3.5, 5), (4, 4.5)]],
+    "$": [[(2.5, -1), (2.5, 8)],
+          [(4.5, 1), (3, 0), (1.5, 0), (0, 1.5), (0, 2.5), (1.5, 3.5), (3.5, 3.5),
+           (5, 4.5), (5, 5.5), (3.5, 7), (2, 7), (0.5, 6)]],
+    "*": [[(2.5, 0), (2.5, 7)], [(0, 2), (5, 5)], [(5, 2), (0, 5)]],
+    "+": [[(2.5, 0), (2.5, 7)], [(0, 3.5), (5, 3.5)]],
+    "=": [[(0, 2.5), (5, 2.5)], [(0, 4.5), (5, 4.5)]],
+    "#": [[(2, 0), (1.5, 7)], [(3.5, 0), (3, 7)], [(0, 2.5), (5, 2.5)], [(0, 4.5), (5, 4.5)]],
+    "\u00b7": [[(2.2, 3), (2.8, 3)]],
+    "&": [[(4.5, 0), (3, 0), (1.5, 0.5), (1, 2), (2, 3.5), (4.5, 5.5), (4.5, 7), (2, 7),
+           (0, 6), (0, 5), (1.5, 4), (4, 2)]],
+}
+
+# lowercase: shrink capitals to x-height (y 2..7), ascenders full height,
+# descenders get their own shapes.
+_ASC = set("bdfhklt")
+_DESC = set("gjpqy")
+for _c in "abcdefghijklmnopqrstuvwxyz":
+    _up = _c.upper()
+    if _c in _DESC:
+        continue
+    if _c in _ASC:
+        FONT[_c] = FONT[_up]
+    else:
+        FONT[_c] = [[(x, 1.6 + y * 0.77) for (x, y) in st] for st in FONT[_up]]
+FONT["g"] = [[(1, 3), (3, 2), (4.5, 3.5), (4.5, 5.5), (3, 7), (1, 7), (0, 5.5), (0, 3.5), (1, 3)],
+             [(4.5, 5), (4.5, 8), (3.5, 9.5), (2, 9.5), (1, 8.5)]]
+FONT["j"] = [[(3.8, -1.2), (4.2, -1.2)], [(4, 0), (4, 6), (3, 8.5), (1.5, 9), (0.5, 8)]]
+FONT["p"] = [[(0, 2), (0, 9.5)], [(0, 2), (3, 2), (4.5, 3.5), (4.5, 5.5), (3, 7), (0, 7)]]
+FONT["q"] = [[(4.5, 2), (4.5, 9.5)], [(0, 2), (3, 2), (4.5, 3.5), (4.5, 5.5), (3, 7), (0, 7)]]
+FONT["y"] = [[(0, 2), (2.5, 6.5), (5, 2)], [(2.5, 6.5), (1.5, 9.5), (0.5, 9)]]
+FONT["f"] = [[(4, 0), (2.5, 0), (1, 1.5), (1, 7)], [(0, 3.5), (3.5, 3.5)]]
+FONT["t"] = [[(2, 0), (2, 7)], [(0.5, 2.5), (3.5, 2.5)], [(2, 7), (3.5, 7)]]
+FONT["i"] = [[(2.3, -0.8), (2.7, -0.8)], [(2.5, 2), (2.5, 7)]]
+
+ADV = 6.0  # advance width in grid units (5 glyph + 1 space)
+
+
+def text_w(s, u):
+    """Width in px of string s at unit size u (px per grid unit)."""
+    w = 0.0
+    for ch in s:
+        w += 3.0 * u if ch == " " else ADV * u
+    return w - (ADV * u if s else 0)
+
+
+def draw_text(cv, x, y, s, u, color, lw=None):
+    """Draw s with its top at y. Returns width used. lw = stroke px."""
+    if lw is None:
+        lw = max(1, int(round(u * 0.32)))
+    cx = float(x)
+    for ch in s:
+        if ch == " ":
+            cx += 3.0 * u
+            continue
+        gl = _g(ch)
+        if gl is None:
+            cx += ADV * u
+            continue
+        for st in gl:
+            pts = [(cx + px * u, y + py * u) for (px, py) in st]
+            if len(pts) == 1:
+                cv.disc(int(pts[0][0]), int(pts[0][1]), max(1, lw // 2), color)
+            else:
+                for a, b in zip(pts, pts[1:]):
+                    cv.line(int(a[0]), int(a[1]), int(b[0]), int(b[1]), color, lw)
+        cx += ADV * u
+    return cx - x
+
+
+def wrap(s, u, maxw):
+    words = s.split(" ")
     lines, cur = [], ""
-    for word in words:
-        trial = (cur + " " + word).strip()
-        if draw.textlength(trial, font=fnt) <= max_w or not cur:
+    for wd in words:
+        trial = (cur + " " + wd).strip()
+        if text_w(trial, u) <= maxw or not cur:
             cur = trial
         else:
             lines.append(cur)
-            cur = word
+            cur = wd
     if cur:
         lines.append(cur)
     return lines
 
 
-def para(draw, x, y, text, fnt, color, max_w, leading=None):
-    """Draw wrapped text; returns the y just below the last line."""
-    leading = leading or int(fnt.size * 1.22)
-    for line in wrap(draw, text, fnt, max_w):
-        draw.text((x, y), line, font=fnt, fill=color)
-        y += leading
+def draw_para(cv, x, y, s, u, color, maxw, lh=None):
+    if lh is None:
+        lh = int(10 * u)
+    for ln in wrap(s, u, maxw):
+        draw_text(cv, x, y, ln, u, color)
+        y += lh
     return y
 
 
-def trunc(draw, text, fnt, max_w):
-    """Shorten text with an ellipsis so it fits max_w."""
-    if draw.textlength(text, font=fnt) <= max_w:
-        return text
-    while text and draw.textlength(text + "...", font=fnt) > max_w:
-        text = text[:-1]
-    return text + "..."
+def trunc(s, u, maxw):
+    """Shorten s with '...' so it fits maxw at unit size u."""
+    if text_w(s, u) <= maxw:
+        return s
+    while s and text_w(s + "...", u) > maxw:
+        s = s[:-1]
+    return s + "..."
 
 
-# ---------------------------------------------------------------- stories
-# (lead, card, index) — every story is dated Monday 23 November 2026.
+# ---------------------------------------------------------------- stories --
+# Every story is dated Monday 23 November 2026. (Same content as the
+# rejected v1; only the renderer changed from Pillow to pure stdlib.)
 LEADS = [
     {
-        "kicker": "LEAD 1  •  CLIMATE  •  ANTALYA",
+        "kicker": "LEAD 1 \u00b7 CLIMATE \u00b7 ANTALYA",
         "headline": "COP31 COLLAPSES: 'WORST EVER'",
         "deck": ("Guterres 'deeply disappointed' as oil states hijack the "
                  "talks; the final draft drops any mention of fossil fuels."),
         "art": "cop",
     },
     {
-        "kicker": "LEAD 2  •  MIDDLE EAST  •  THE GULF",
+        "kicker": "LEAD 2 \u00b7 MIDDLE EAST \u00b7 THE GULF",
         "headline": "IRAN HITS US BASE; OIL ROUTE IN FLAMES",
         "deck": ("Tehran strikes the US base in Bahrain; 25 tankers hit "
                  "in the Strait of Hormuz in 7 days. Houthis hit Riyadh, "
@@ -167,7 +384,7 @@ REGIONS = [
     (6, "SE Asia & Oceania", TEAL, (128, -8)),
     (7, "Latin America", BROWN, (-60, -15)),
     (8, "North America", NAVY, (-100, 45)),
-    (9, "Global & Space", GRAY, (-150, -20)),
+    (9, "Global & Space", GREY, (-150, -20)),
 ]
 
 # Rough equirectangular continent outlines (lon, lat).
@@ -205,110 +422,104 @@ CONTINENTS = [
 ]
 
 
-def draw_flame(draw, x, y, s):
+# ------------------------------------------------------------ illustrations --
+def draw_flame(cv, x, y, s):
     """Stylised flame, base at (x, y), height s."""
-    draw.polygon([(x - s * 0.45, y), (x - s * 0.15, y - s * 0.55),
+    cv.fill_poly([(x - s * 0.45, y), (x - s * 0.15, y - s * 0.55),
                   (x, y - s), (x + s * 0.2, y - s * 0.5),
-                  (x + s * 0.45, y)], fill=ORANGE)
-    draw.polygon([(x - s * 0.22, y), (x - s * 0.05, y - s * 0.35),
-                  (x + s * 0.08, y - s * 0.55), (x + s * 0.22, y)],
-                 fill=GOLD)
+                  (x + s * 0.45, y)], ORANGE)
+    cv.fill_poly([(x - s * 0.22, y), (x - s * 0.05, y - s * 0.35),
+                  (x + s * 0.08, y - s * 0.55), (x + s * 0.22, y)], GOLD)
 
 
-def draw_icon(draw, kind, cx, cy, color):
+def draw_icon(cv, kind, cx, cy, color):
     """Small glyph for a briefing card, centred on (cx, cy)."""
     if kind == "badge":
-        draw.ellipse([cx - 16, cy - 16, cx + 16, cy + 16], fill=color)
-        draw.ellipse([cx - 11, cy - 11, cx + 11, cy + 11],
-                     outline=WHITE, width=2)
-        draw.text((cx - 5, cy - 8), "*", font=SANS_B(20), fill=WHITE)
+        cv.disc(cx, cy, 16, color)
+        cv.circle(cx, cy, 11, WHITE, 2)
+        draw_text(cv, cx - 5, cy - 8, "*", 1.6, WHITE)
     elif kind == "flame":
-        draw_flame(draw, cx, cy + 14, 30)
+        draw_flame(cv, cx, cy + 14, 30)
     elif kind == "building":
-        draw.rectangle([cx - 14, cy - 14, cx + 14, cy + 16], fill=color)
+        cv.rect(cx - 14, cy - 14, 28, 30, color)
         for bx in (-8, 2):
             for by in (-8, 0, 8):
-                draw.rectangle([cx + bx, cy + by, cx + bx + 5, cy + by + 5],
-                               fill=WHITE)
-        draw_flame(draw, cx + 6, cy - 12, 16)
+                cv.rect(cx + bx, cy + by, 5, 5, WHITE)
+        draw_flame(cv, cx + 6, cy - 12, 16)
     elif kind == "rocket":
-        draw.polygon([(cx, cy - 18), (cx + 8, cy + 2), (cx + 4, cy + 12),
+        cv.fill_poly([(cx, cy - 18), (cx + 8, cy + 2), (cx + 4, cy + 12),
                       (cx, cy + 6), (cx - 4, cy + 12), (cx - 8, cy + 2)],
-                     fill=color)
-        draw.ellipse([cx - 4, cy - 8, cx + 4, cy], fill=WHITE)
-        draw_flame(draw, cx, cy + 18, 12)
+                     color)
+        cv.disc(cx, cy - 4, 4, WHITE)
+        draw_flame(cv, cx, cy + 18, 12)
     elif kind == "file":
-        draw.rectangle([cx - 11, cy - 15, cx + 11, cy + 15], fill=WHITE,
-                       outline=color, width=2)
-        for i, ly in enumerate((-8, -1, 6)):
-            draw.line([cx - 7, cy + ly, cx + 7, cy + ly], fill=color, width=2)
+        cv.rect(cx - 11, cy - 15, 22, 30, WHITE)
+        cv.line(cx - 11, cy - 15, cx + 11, cy - 15, color, 2)
+        cv.line(cx - 11, cy + 15, cx + 11, cy + 15, color, 2)
+        cv.line(cx - 11, cy - 15, cx - 11, cy + 15, color, 2)
+        cv.line(cx + 11, cy - 15, cx + 11, cy + 15, color, 2)
+        for ly in (-8, -1, 6):
+            cv.line(cx - 7, cy + ly, cx + 7, cy + ly, color, 2)
     elif kind == "chip":
-        draw.rectangle([cx - 13, cy - 13, cx + 13, cy + 13], fill=color)
-        draw.rectangle([cx - 6, cy - 6, cx + 6, cy + 6], fill=WHITE)
+        cv.rect(cx - 13, cy - 13, 26, 26, color)
+        cv.rect(cx - 6, cy - 6, 12, 12, WHITE)
         for dx in (-13, 0, 13):
-            draw.line([cx + dx, cy - 18, cx + dx, cy - 13], fill=color,
-                      width=3)
-            draw.line([cx + dx, cy + 13, cx + dx, cy + 18], fill=color,
-                      width=3)
+            cv.line(cx + dx, cy - 18, cx + dx, cy - 13, color, 3)
+            cv.line(cx + dx, cy + 13, cx + dx, cy + 18, color, 3)
 
 
-def draw_cop_art(draw, x, y, w, h):
+def draw_cop_art(cv, x, y, w, h):
     """COP31 art: night sky, orange sun, summit hall, smoke, red banner."""
-    draw.rectangle([x, y, x + w, y + h], fill=DARK)
-    draw.ellipse([x + w - 110, y + 14, x + w - 30, y + 94], fill=ORANGE)
-    for sx in (x + 60, x + 150, x + 260, x + 360):
-        draw.ellipse([sx, y + 22, sx + 26, y + 48], fill=(120, 130, 150))
-    # Summit hall: columns and roof.
-    draw.rectangle([x + 40, y + 96, x + w - 40, y + h - 26], fill=(52, 68, 96))
-    draw.polygon([(x + 20, y + 98), (x + w // 2, y + 58),
-                  (x + w - 20, y + 98)], fill=(70, 88, 118))
+    cv.rect(x, y, w, h, DARK)
+    cv.disc(x + w - 70, y + 34, 26, ORANGE)
+    for sx, sy in [(x + 60, y + 26), (x + 150, y + 18), (x + 260, y + 30)]:
+        cv.disc(sx, sy, 10, (120, 130, 150))
+        cv.disc(sx + 12, sy + 3, 8, (120, 130, 150))
+    # Summit hall: roof, walls, columns.
+    cv.fill_poly([(x + 20, y + 78), (x + w // 2, y + 44),
+                  (x + w - 20, y + 78)], (70, 88, 118))
+    cv.rect(x + 40, y + 78, w - 80, 28, (52, 68, 96))
     for i in range(6):
-        cx = x + 62 + i * 62
-        draw.rectangle([cx, y + 104, cx + 16, y + h - 26], fill=(200, 205, 215))
+        cx = x + 56 + i * 62
+        cv.rect(cx, y + 80, 10, 24, (200, 205, 215))
     # Chimneys with smoke on the right.
-    draw.rectangle([x + w - 96, y + 78, x + w - 78, y + h - 26],
-                   fill=(90, 96, 110))
-    draw.rectangle([x + w - 66, y + 88, x + w - 50, y + h - 26],
-                   fill=(90, 96, 110))
-    for i, (dx, dy, r) in enumerate([(0, 0, 9), (10, -14, 11), (24, -26, 13)]):
-        draw.ellipse([x + w - 88 + dx - r, y + 66 + dy - r,
-                      x + w - 88 + dx + r, y + 66 + dy + r],
-                     fill=(150, 150, 150))
+    cv.rect(x + w - 96, y + 60, 18, 46, (90, 96, 110))
+    cv.rect(x + w - 66, y + 68, 16, 38, (90, 96, 110))
+    for dx, dy, r in [(0, 0, 8), (10, -12, 10), (24, -22, 12)]:
+        cv.disc(x + w - 88 + dx, y + 52 + dy, r, (150, 150, 150))
     # Red FAILED banner.
-    draw.rectangle([x, y + h - 26, x + w, y + h], fill=RED)
-    draw.text((x + 12, y + h - 24), "TALKS COLLAPSE  •  NO DEAL",
-              font=SANS_B(15), fill=WHITE)
+    cv.rect(x, y + h - 26, w, 26, RED)
+    draw_text(cv, x + 12, y + h - 22, "TALKS COLLAPSE \u00b7 NO DEAL", 1.6, WHITE)
 
 
-def draw_gulf_art(draw, x, y, w, h):
+def draw_gulf_art(cv, x, y, w, h):
     """Gulf art: grey sky, tanker on a dark sea, missile trails, fire."""
-    draw.rectangle([x, y, x + w, y + h], fill=(150, 168, 186))
-    draw.rectangle([x, y + h - 64, x + w, y + h], fill=(24, 52, 84))
+    cv.rect(x, y, w, h, (150, 168, 186))
+    cv.rect(x, y + h - 64, w, 64, (24, 52, 84))
     # Missile trails arcing down from the sky.
     for tx, bx in ((90, 150), (210, 260), (330, 380)):
-        draw.line([x + tx, y + 6, x + bx, y + h - 70], fill=WHITE, width=3)
-        draw.ellipse([x + bx - 5, y + h - 76, x + bx + 5, y + h - 66],
-                     fill=GOLD)
+        cv.line(x + tx, y + 6, x + bx, y + h - 70, WHITE, 3)
+        cv.disc(x + bx, y + h - 70, 5, GOLD)
     # Tanker silhouette.
-    draw.rectangle([x + 40, y + h - 58, x + w - 60, y + h - 30],
-                   fill=(20, 20, 24))
+    cv.rect(x + 40, y + h - 58, w - 100, 28, (20, 20, 24))
     for i in range(5):
-        draw.rectangle([x + 56 + i * 68, y + h - 84, x + 112 + i * 68,
-                        y + h - 58], fill=(200, 60, 50) if i % 2 else
-                       (60, 120, 90))
-    draw.rectangle([x + w - 150, y + h - 96, x + w - 110, y + h - 58],
-                   fill=(220, 220, 220))
+        cv.rect(x + 56 + i * 68, y + h - 84, 56, 26,
+                (200, 60, 50) if i % 2 else (60, 120, 90))
+    cv.rect(x + w - 150, y + h - 96, 40, 38, (220, 220, 220))
     # Fire on the waterline.
-    draw_flame(draw, x + 120, y + h - 58, 26)
-    draw_flame(draw, x + 300, y + h - 58, 20)
-    draw.rectangle([x, y + h - 26, x + w, y + h], fill=RED)
-    draw.text((x + 12, y + h - 24), "25 TANKERS HIT IN 7 DAYS",
-              font=SANS_B(15), fill=WHITE)
+    draw_flame(cv, x + 120, y + h - 58, 26)
+    draw_flame(cv, x + 300, y + h - 58, 20)
+    cv.rect(x, y + h - 26, w, 26, RED)
+    draw_text(cv, x + 12, y + h - 22, "25 TANKERS HIT IN 7 DAYS", 1.6, WHITE)
 
 
-def draw_map(draw, x, y, w, h):
+def draw_map(cv, x, y, w, h):
     """Equirectangular world map with numbered region pins + legend."""
-    draw.rectangle([x, y, x + w, y + h], fill=SEA, outline=INK, width=2)
+    cv.rect(x, y, w, h, SEA)
+    cv.line(x, y, x + w, y, INK, 1)
+    cv.line(x, y + h - 1, x + w, y + h - 1, INK, 1)
+    cv.line(x, y, x, y + h, INK, 1)
+    cv.line(x + w - 1, y, x + w - 1, y + h, INK, 1)
 
     def proj(lon, lat):
         px = x + (lon + 180.0) / 360.0 * w
@@ -318,59 +529,106 @@ def draw_map(draw, x, y, w, h):
     # Graticule every 30 degrees.
     for lon in range(-150, 181, 30):
         px, _ = proj(lon, 0)
-        draw.line([px, y, px, y + h], fill=(190, 208, 220), width=1)
+        cv.line(int(px), y, int(px), y + h, (190, 208, 220), 1)
     for lat in range(-60, 91, 30):
         _, py = proj(0, lat)
-        draw.line([x, py, x + w, py], fill=(190, 208, 220), width=1)
+        cv.line(x, int(py), x + w, int(py), (190, 208, 220), 1)
     # Continents.
     for poly in CONTINENTS:
-        draw.polygon([proj(lon, lat) for lon, lat in poly], fill=LAND,
-                     outline=LAND_EDGE)
+        pts = [(int(px), int(py)) for px, py in
+               (proj(lon, lat) for lon, lat in poly)]
+        cv.fill_poly(pts, LAND)
+        cv.poly(pts + [pts[0]], LAND_EDGE)
     # Region pins: coloured disc, white number.
     for num, name, color, (lon, lat) in REGIONS:
         px, py = proj(lon, lat)
-        draw.ellipse([px - 11, py - 11, px + 11, py + 11], fill=color,
-                     outline=WHITE, width=2)
-        tw = draw.textlength(str(num), font=SANS_B(13))
-        draw.text((px - tw / 2, py - 9), str(num), font=SANS_B(13),
-                  fill=WHITE)
+        px, py = int(px), int(py)
+        cv.disc(px, py, 11, color)
+        cv.circle(px, py, 11, WHITE, 1)
+        snum = str(num)
+        draw_text(cv, px - int(text_w(snum, 1.3)) // 2, py - 5, snum, 1.3, WHITE)
     # Legend strip at the bottom of the map.
     ly = y + h - 52
-    draw.rectangle([x, ly, x + w, y + h], fill=PAPER)
-    draw.line([x, ly, x + w, ly], fill=INK, width=1)
-    cols = 3
+    cv.rect(x, ly, w, 52, PAPER)
+    cv.line(x, ly, x + w, ly, INK, 1)
     for i, (num, name, color, _loc) in enumerate(REGIONS):
-        cx = x + 10 + (i % cols) * (w // cols)
-        cy = ly + 6 + (i // cols) * 16
-        draw.ellipse([cx, cy, cx + 12, cy + 12], fill=color)
-        tw = draw.textlength(str(num), font=SANS_B(9))
-        draw.text((cx + 6 - tw / 2, cy - 1), str(num), font=SANS_B(9),
-                  fill=WHITE)
-        draw.text((cx + 17, cy), name, font=SANS(10), fill=INK)
+        cx = x + 10 + (i % 3) * (w // 3)
+        cy = ly + 6 + (i // 3) * 16
+        cv.disc(cx + 6, cy + 6, 6, color)
+        snum = str(num)
+        draw_text(cv, cx + 6 - int(text_w(snum, 1.0)) // 2, cy + 2, snum, 1.0, WHITE)
+        draw_text(cv, cx + 17, cy + 1, name, 1.2, INK)
 
 
-def main():
-    img = Image.new("RGB", (W, H), CREAM)
-    d = ImageDraw.Draw(img)
-    # Double outer rule.
-    d.rectangle([10, 10, W - 11, H - 11], outline=INK, width=2)
-    d.rectangle([16, 16, W - 17, H - 17], outline=INK, width=1)
+# ------------------------------------------------------------------ layout --
+def draw_lead(cv, x, y, w, st):
+    h = 252
+    cv.rect(x, y, w, h, PAPER)
+    cv.line(x, y, x + w, y, INK, 1)
+    cv.line(x, y + h - 1, x + w, y + h - 1, INK, 1)
+    cv.line(x, y, x, y + h, INK, 1)
+    cv.line(x + w - 1, y, x + w - 1, y + h, INK, 1)
+    if st["art"] == "cop":
+        draw_cop_art(cv, x + 1, y + 1, w - 2, 132)
+    else:
+        draw_gulf_art(cv, x + 1, y + 1, w - 2, 132)
+    draw_text(cv, x + 12, y + 140, st["kicker"], 1.4, RED)
+    yy = y + 158
+    for ln in wrap(st["headline"], 2.0, w - 24)[:2]:
+        draw_text(cv, x + 12, yy, ln, 2.0, INK)
+        yy += 20
+    yy += 2
+    for ln in wrap(st["deck"], 1.5, w - 24)[:3]:
+        draw_text(cv, x + 12, yy, ln, 1.5, INK)
+        yy += 15
+    return h
+
+
+def draw_card(cv, x, y, w, num, region, head, kind, color):
+    h = 62
+    cv.rect(x, y, w, h, WHITE)
+    cv.line(x, y, x + w, y, INK, 1)
+    cv.line(x, y + h - 1, x + w, y + h - 1, INK, 1)
+    cv.line(x, y, x, y + h, INK, 1)
+    cv.line(x + w - 1, y, x + w - 1, y + h, INK, 1)
+    cv.rect(x, y, 34, h, LIGHT)
+    cv.line(x + 34, y, x + 34, y + h, GREY, 1)
+    draw_text(cv, x + 17 - int(text_w(num, 2.4)) // 2, y + 8, num, 2.4, RED)
+    draw_icon(cv, kind, x + 58, y + 31, color)
+    draw_text(cv, x + 82, y + 7, region, 1.1, RED)
+    yy = y + 20
+    for ln in wrap(head, 1.25, w - 92)[:2]:
+        draw_text(cv, x + 82, yy, ln, 1.25, INK)
+        yy += 13
+    return h
+
+
+def build():
+    cv = Canvas(W, H, PAPER)
+    mx, cw = 24, 976
+    # outer double rule
+    cv.line(10, 10, W - 11, 10, INK, 2)
+    cv.line(10, H - 11, W - 11, H - 11, INK, 2)
+    cv.line(10, 10, 10, H - 11, INK, 2)
+    cv.line(W - 11, 10, W - 11, H - 11, INK, 2)
+    cv.line(16, 16, W - 17, 16, INK, 1)
+    cv.line(16, H - 17, W - 17, H - 17, INK, 1)
+    cv.line(16, 16, 16, H - 17, INK, 1)
+    cv.line(W - 17, 16, W - 17, H - 17, INK, 1)
 
     # ---------------------------------------------------------- masthead
-    d.text((W // 2 - d.textlength("THE WORLD IN ONE DAY  •  EST. EVERY MORNING",
-                                  font=SANS_B(13)) / 2, 26),
-           "THE WORLD IN ONE DAY  •  EST. EVERY MORNING",
-           font=SANS_B(13), fill=GRAY)
+    cv.rect(mx, 26, cw, 26, RED)
+    draw_text(cv, mx + 10, 31, "THE WORLD IN ONE DAY \u00b7 EST. EVERY MORNING",
+              1.6, WHITE)
+    rt = "35 STORIES \u00b7 9 REGIONS \u00b7 EVERY ONE DATED MONDAY 23 NOVEMBER 2026"
+    draw_text(cv, mx + cw - 10 - int(text_w(rt, 1.3)), 33, rt, 1.3, WHITE)
     title = "THE WORLD IN ONE DAY"
-    d.text((W // 2 - d.textlength(title, font=SERIF_B(52)) / 2, 44),
-           title, font=SERIF_B(52), fill=INK)
-    d.line([24, 106, W - 24, 106], fill=RED, width=4)
+    draw_text(cv, (W - int(text_w(title, 5.5))) // 2, 58, title, 5.5, INK)
+    cv.rect(mx, 106, cw, 4, RED)
     date = "MONDAY 23 NOVEMBER 2026"
-    d.text((W // 2 - d.textlength(date, font=SERIF_B(34)) / 2, 114),
-           date, font=SERIF_B(34), fill=RED)
-    sub = "35 stories  |  9 regions  -  the whole world on one page"
-    d.text((W // 2 - d.textlength(sub, font=SERIF_I(16)) / 2, 152),
-           sub, font=SERIF_I(16), fill=INK)
+    draw_text(cv, (W - int(text_w(date, 3.2))) // 2, 118, date, 3.2, RED)
+    sub = "35 stories \u00b7 9 regions - the whole world on one page"
+    draw_text(cv, (W - int(text_w(sub, 1.6))) // 2, 152, sub, 1.6, INK)
 
     # -------------------------------------------------------- stat strip
     stats = [("35", "STORIES"), ("9", "REGIONS"), ("2", "LEADS"),
@@ -378,83 +636,79 @@ def main():
     sx, sy, sw, sh = 24, 176, 160, 40
     for i, (num, label) in enumerate(stats):
         bx = sx + i * (sw + 3)
-        d.rectangle([bx, sy, bx + sw, sy + sh], fill=NAVY)
-        d.text((bx + sw // 2 - d.textlength(num, font=SERIF_B(20)) / 2,
-                sy + 2), num, font=SERIF_B(20), fill=WHITE)
-        d.text((bx + sw // 2 - d.textlength(label, font=SANS_B(9)) / 2,
-                sy + 25), label, font=SANS_B(9), fill=GOLD)
+        cv.rect(bx, sy, sw, sh, NAVY)
+        draw_text(cv, bx + sw // 2 - int(text_w(num, 2.4)) // 2, sy + 2,
+                  num, 2.4, WHITE)
+        draw_text(cv, bx + sw // 2 - int(text_w(label, 1.2)) // 2, sy + 25,
+                  label, 1.2, GOLD)
 
     # ------------------------------------------------------------- leads
     ly = 228
     lw, lh = 476, 252
     for i, lead in enumerate(LEADS):
         lx = 24 + i * (lw + 24)
-        d.rectangle([lx, ly, lx + lw, ly + lh], fill=PAPER, outline=INK,
-                    width=1)
-        if lead["art"] == "cop":
-            draw_cop_art(d, lx + 1, ly + 1, lw - 2, 132)
-        else:
-            draw_gulf_art(d, lx + 1, ly + 1, lw - 2, 132)
-        ty = ly + 140
-        d.text((lx + 12, ty), lead["kicker"], font=SANS_B(11), fill=RED)
-        ty = para(d, lx + 12, ty + 18, lead["headline"], SERIF_B(24),
-                  INK, lw - 24, leading=27)
-        para(d, lx + 12, ty + 2, lead["deck"], SANS(12), INK, lw - 24,
-             leading=16)
+        draw_lead(cv, lx, ly, lw, lead)
 
     # ------------------------------------------------------------ cards
     cy = 492
-    d.text((24, cy), "BRIEFINGS", font=SANS_B(13), fill=RED)
-    d.line([130, cy + 8, W - 24, cy + 8], fill=INK, width=1)
-    cw, chh, gap = 320, 62, 8
+    draw_text(cv, 24, cy, "BRIEFINGS", 1.6, RED)
+    cv.line(130, cy + 8, W - 24, cy + 8, INK, 1)
+    cw2, chh, gap = 320, 62, 8
+    colors = [RED, ORANGE, NAVY, PURPLE, BLUE, TEAL]
     for i, (num, region, head, kind) in enumerate(CARDS):
-        cx = 24 + (i % 3) * (cw + gap)
+        cx = 24 + (i % 3) * (cw2 + gap)
         cyy = cy + 20 + (i // 3) * (chh + gap)
-        d.rectangle([cx, cyy, cx + cw, cyy + chh], fill=WHITE,
-                    outline=INK, width=1)
-        d.rectangle([cx, cyy, cx + 34, cyy + chh], fill=LIGHT)
-        tw = d.textlength(num, font=SERIF_B(20))
-        d.text((cx + 17 - tw / 2, cyy + 6), num, font=SERIF_B(20),
-               fill=RED)
-        d.text((cx + 17 - d.textlength(region, font=SANS_B(7)) / 2,
-                cyy + 34), region, font=SANS_B(7), fill=INK)
-        draw_icon(d, kind, cx + 56, cyy + chh // 2,
-                  [RED, ORANGE, NAVY, PURPLE, BLUE, TEAL][i])
-        para(d, cx + 82, cyy + 8, head, SANS_B(12), INK, cw - 92,
-             leading=15)
+        draw_card(cv, cx, cyy, cw2, num, region, head, kind, colors[i])
 
     # ------------------------------------------------- map + index
     by = 656
-    d.text((24, by), "WORLD MAP  •  WHERE IT HAPPENED", font=SANS_B(13),
-           fill=RED)
-    d.line([300, by + 8, 624, by + 8], fill=INK, width=1)
-    d.text((640, by), "THE INDEX  •  STORIES 9–35", font=SANS_B(13),
-           fill=RED)
-    d.line([872, by + 8, W - 24, by + 8], fill=INK, width=1)
-    draw_map(d, 24, by + 22, 600, 310)
+    draw_text(cv, 24, by, "WORLD MAP \u00b7 WHERE IT HAPPENED", 1.6, RED)
+    cv.line(310, by + 8, 624, by + 8, INK, 1)
+    draw_text(cv, 640, by, "THE INDEX \u00b7 STORIES 9-35", 1.6, RED)
+    cv.line(872, by + 8, W - 24, by + 8, INK, 1)
+    draw_map(cv, 24, by + 22, 600, 310)
     ix, iy, iw, ih = 640, by + 22, 360, 310
-    d.rectangle([ix, iy, ix + iw, iy + ih], fill=PAPER, outline=INK,
-                width=1)
+    cv.rect(ix, iy, iw, ih, PAPER)
+    cv.line(ix, iy, ix + iw, iy, INK, 1)
+    cv.line(ix, iy + ih - 1, ix + iw, iy + ih - 1, INK, 1)
+    cv.line(ix, iy, ix, iy + ih, INK, 1)
+    cv.line(ix + iw - 1, iy, ix + iw - 1, iy + ih, INK, 1)
     col_w = iw // 2
-    fnt = SANS(10)
     for j, item in enumerate(INDEX):
         col = j // 14
         row = j % 14
         tx = ix + 10 + col * col_w
-        tyy = iy + 10 + row * 21
-        label = "%d. %s" % (j + 9, item)
-        d.text((tx, tyy), trunc(d, label, fnt, col_w - 14), font=fnt,
-               fill=INK)
-    d.text((24, H - 30),
-           "All stories dated Monday 23 November 2026  •  Wires to 08:55 WITA  •  Drawn in code",
-           font=SANS(11), fill=GRAY)
+        tyy = iy + 8 + row * 21
+        label = trunc("%d. %s" % (j + 9, item), 1.15, col_w - 14)
+        draw_text(cv, tx, tyy, label, 1.15, INK)
 
-    out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR", "")
-    if not out_dir:
+    # ------------------------------------------------------------ footer
+    draw_text(cv, 24, H - 30,
+              "All stories dated Monday 23 November 2026 \u00b7 Wires to 08:55 WITA \u00b7 Drawn in code",
+              1.4, GREY)
+
+    # deterministic paper grain: a sparse, fixed hash pattern so the page
+    # reads as printed stock. Kept very light to stay under the 1 MB cap.
+    for gy in range(0, H, 2):
+        for gx in range(0, W, 2):
+            hv = ((gx * 2654435761) ^ (gy * 40503) ^ 0x9E3779B9) % 41
+            if hv < 2:
+                d = 5 + hv * 3
+                i = (gy * W + gx) * 3
+                cv.px[i] = max(0, cv.px[i] - d)
+                cv.px[i + 1] = max(0, cv.px[i + 1] - d)
+                cv.px[i + 2] = max(0, cv.px[i + 2] - d)
+    return cv, H - 18
+
+
+def main():
+    out = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
+    if not out:
         raise SystemExit("MAKEFUN_OUTPUT_DIR is not set")
-    os.makedirs(out_dir, exist_ok=True)
-    img.save(os.path.join(out_dir, "entry.png"), format="PNG",
-             optimize=True)
+    os.makedirs(out, exist_ok=True)
+    cv, bottom = build()
+    assert bottom <= H, "layout overflow: %d" % bottom
+    write_png(os.path.join(out, "entry.png"), cv.px, W, H)
 
 
 if __name__ == "__main__":
