@@ -551,7 +551,7 @@ def draw_page():
         (524, "LEAD 2 - MIDDLE EAST - THE GULF",
          "IRAN HITS US BASE; OIL ROUTE IN FLAMES",
          "Tehran strikes the US base in Bahrain; 25 tankers hit in the "
-         "Strait of Hormuz in 7 days. Houthis hit Riyadh, day 3.",
+         "Strait of Hormuz in 7 days.",
          lead2_scene),
     ]
     for lx, kicker, head, deck, scene in leads:
