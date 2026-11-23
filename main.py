@@ -316,7 +316,7 @@ STATS = [
 ]
 
 BRIEFINGS = [
-    ("3", "MEXICO", "Cartel boss 'El Chapo Isidro' captured; 11 dead in raid", "badge"),
+    ("3", "MEXICO", "Cartel boss 'El Chapo Isidro' captured; 11 dead", "badge"),
     ("4", "FINLAND", "Russian cargo ship ablaze off the Finnish coast", "flame"),
     ("5", "KYIV", "14 missing after Russian drone hits Kyiv tower block", "building"),
     ("6", "SPACE", "BepiColombo enters Mercury orbit after 8 years", "rocket"),
@@ -546,7 +546,7 @@ def draw_page():
         (24, "LEAD 1 - CLIMATE - ANTALYA",
          "COP31 COLLAPSES: 'WORST EVER'",
          "Guterres 'deeply disappointed' as oil states hijack the talks; "
-         "the final draft drops any mention of fossil fuels.",
+         "the final draft drops fossil fuels.",
          lead1_scene),
         (524, "LEAD 2 - MIDDLE EAST - THE GULF",
          "IRAN HITS US BASE; OIL ROUTE IN FLAMES",
@@ -560,7 +560,7 @@ def draw_page():
         scene(lx + 8, 220, 460, 118)
         text(lx + 12, 348, kicker, 1, RED)
         para(lx + 12, 364, head, 3, INK, 452, leading=24)
-        para(lx + 12, 416, deck, 2, INK, 452, leading=17)
+        para(lx + 12, 416, deck, 2, INK, 452, leading=16)
 
     # 4. Briefings
     text(24, 476, "BRIEFINGS", 2, RED)
@@ -574,7 +574,7 @@ def draw_page():
         text(bx + 10, by + 8, num, 5, RED)
         icon(bx + bw - 40, by + 8, kind, NAVY)
         text(bx + 52, by + 10, region, 2, NAVY)
-        para(bx + 52, by + 30, head, 2, INK, bw - 64, leading=17)
+        para(bx + 52, by + 30, head, 2, INK, bw - 64, leading=15)
 
     # 5 + 6. Map (left) and Index (right)
     text(24, 668, "WORLD MAP - 9 REGIONS", 2, RED)
@@ -619,7 +619,7 @@ def draw_page():
     for idx, item in enumerate(INDEX_ITEMS):
         num = 9 + idx
         cx = col_x[idx // 14]
-        cy = 700 + (idx % 14) * 19
+        cy = 698 + (idx % 14) * 18
         text(cx, cy, str(num), 1, RED)
         para(cx + 16, cy, item, 1, INK, col_w - 16, leading=10)
 
